@@ -1,0 +1,280 @@
+<#
+.SYNOPSIS
+AWS Identity provider login for NAM
+
+.DESCRIPTION
+AWS iDP login with OTP integration to obtain access key id, secret access key and session token. The information is then written to the AWS credentials file by calling the AWS CLI commands.
+AWS CLI and Powershell commandlets will use the credentials for the duration of session, currently configured to 4 hours.
+
+.EXAMPLE
+./AWS-Client.ps1
+
+.NOTES
+Powershell 7.1.2 or later required
+Must be connected to the VPN
+
+Version 1.10
+Written by Tiaan Human
+#>
+
+$baseURL = "https://login.sso.vodacom.co.za"
+$samlURL = "https://login.sso.vodacom.co.za/nidp/saml2/idpsend?id=aws"
+$stsURL = "https://sts.amazonaws.com/"
+$proxy = "http://vfproxy.vodacom.corp"
+$DurationSeconds = 28800 # 8 hours
+$proxyAuth = $false
+
+Write-Host "Login information required to authenticate to NAM"
+#$username = Read-Host -Prompt "Username (no domain required)"
+$username = ""
+$password = ConvertTo-SecureString -String "" -AsPlainText -Force
+#$password = Read-Host -Prompt "Password" -AsSecureString 
+$credential = New-Object System.Management.Automation.PSCredential($username,$password)
+
+# Connect to NAM
+$webrequest1 = Invoke-WebRequest -Uri $samlURL -SessionVariable my_session -SkipHttpErrorCheck -ErrorAction SilentlyContinue -NoProxy
+
+# Get URLs from NAM response
+foreach ($line in $webrequest1.RawContent.Split("`n"))
+{
+  # Get /nidp/jsp/content.jsp
+  if ($line -like "*getToContent('*") {
+    $strUrl1 = $line.Split(",")[0].Replace("getToContent", "").Replace("(", "").Replace("'", "").Trim()
+    $strUrl1 = -join($baseURL, $strUrl1, "&uiDestination=contentDiv")
+  }
+  # Get /nidp/mobileaccess/endpoint/configuration 
+  elseif ($line -like "*var nmaUrl*") 
+  {
+    $strUrl2 = $line.Split("'/")[2].Replace("';", "")
+    $strUrl2 = -join($baseURL, "/", $strUrl2)
+  }
+}
+
+# Connect to /nidp/jsp/content.jsp
+$webrequest2 = Invoke-WebRequest -Uri $strUrl1 -WebSession $my_session -NoProxy
+
+# Get URLs from NAM response
+foreach ($line in $webrequest2.RawContent.Split("`n"))
+{
+  # Get /nidp/app/login
+  if ($line -like "*getToContent('*") {
+    $strUrl3 = $line.Split(",")[0].Replace("getToContent", "").Replace("(", "").Replace("'", "").Trim()
+    $strUrl3 = -join($baseURL, $strUrl3, "&uiDestination=contentDiv")
+  } 
+}
+
+#Write-Host $strUrl1
+#Write-Host $strUrl2
+#Write-Host $strUrl3
+
+# Connect to /nidp/mobileaccess/endpoint/configuration 
+#$webrequest3 = Invoke-WebRequest -Uri $strUrl2 -WebSession $my_session
+
+# Connect to /nidp/app/login
+$webrequestAppLogin = Invoke-WebRequest -Uri $strUrl3 -WebSession $my_session -NoProxy
+#$webrequestAppLogin.Content
+
+# Get Post URL
+foreach ($line in $webrequestAppLogin.RawContent.Split("`n"))
+{
+  # Get /nidp/app/login
+  if ($line -like "*action=*") {
+    #Write-Host $line.Split("action=")[1].Split(" ")[0].Replace('"',"")
+    $strUrl4 = $line.Split("action=")[1].Split(" ")[0].Replace('"',"")
+    $strUrl4 = -join($strUrl4, "&uiDestination=contentDiv")
+  } 
+}
+
+# Form data to post to /nidp/app/login
+$formFieldsLogin = @{option='credential'
+                Ecom_User_ID=$credential.GetNetworkCredential().UserName
+                Ecom_Password=$credential.GetNetworkCredential().Password
+              }
+
+# Post to /nidp/app/login
+$responseLogin = Invoke-WebRequest -Uri $strUrl4 -WebSession $my_session -Method Post -Body $formFieldsLogin -NoProxy
+#$responseLogin.Content
+
+if (!$responseLogin.Content.Contains("Login failed"))
+{
+  Write-Host "Login succeed"  
+
+  # Get TOTP Post URL
+  foreach ($line in $responseLogin.RawContent.Split("`n"))
+  {
+    # Get /osp/a/TOP/auth/oauth2/grant
+    if ($line -like "*action=*") {
+      #$strUrl5 = $line.Split("action=")[1].Split(" ")[0].Replace('"',"").Replace('>',"")
+      $formURLTOTP = $line.Split('"')[5]
+    } 
+    # Get parameters form field
+    if ($line -like "*parameters*") {
+      $formFieldTOTPParameters = $line.Split('"')[5]
+    }   
+    # Get forceAuth form field
+    if ($line -like "*forceAuth*") {
+      $formFieldTOTPforceAuth = $line.Split('"')[5]
+    }   
+  }
+
+  # Form data to post to /osp/a/TOP/auth/oauth2/grant
+  $formFieldsTOTP = @{forceAuth=$formFieldTOTPforceAuth
+                  parameters =$formFieldTOTPParameters
+                }
+
+  # Post to /osp/a/TOP/auth/oauth2/grant
+  $responseTOTP = Invoke-WebRequest -Uri $formURLTOTP -WebSession $my_session -Method Post -Body $formFieldsTOTP -NoProxy
+  #$responseTOTP.RawContent
+
+  Write-Host -NoNewline "Enter One Time Pin: "
+  
+  $toptp = Read-Host
+  
+  # Get TOTP Post URL 2
+  foreach ($line in $responseTOTP.RawContent.Split("`n"))
+  {
+    # Get /osp/a/TOP/auth/app/contractcontinue
+    if ($line -like "*action=*") {
+      #$strUrl5 = $line.Split("action=")[1].Split(" ")[0].Replace('"',"").Replace('>',"")
+      $formURLTOTP2 = $line.Split('"')[9]
+      #$formURLTOTP2 = -join($baseURL, $formURLTOTP2)
+      $formURLTOTP2 = $formURLTOTP2.Replace('%24','$')
+    } 
+    # Get option form field
+    if ($line -like "*option*") {
+      $formFieldTOTPOption = $line.Split('"')[5]
+    }   
+    # Get nfst form field
+    if ($line -like "*nfst*") {
+      $formFieldTOTPnfst = $line.Split('"')[5]
+    }   
+    # Get nfpr form field
+    if ($line -like "*nfpr*") {
+      $formFieldTOTPnfpr = $line.Split('"')[5]
+    }     
+    # Get nfmt form field
+    if ($line -like "*nfmt*") {
+      $formFieldTOTPnfmt = $line.Split('"')[5]
+    }     
+    # Get nfcn form field
+    if ($line -like "*nfcn*") {
+      $formFieldTOTPnfcn = $line.Split('"')[5]
+    } 
+    # Get nfch form field
+    if ($line -like "*nfch*") {
+      $formFieldTOTPnfch = $line.Split('"')[5]
+    }  
+    # Get cexid form field
+    if ($line -like "*cexid*") {
+      $formFieldTOTPcexid = $line.Split('"')[5]
+    }   
+    # Get nfre form field
+    if ($line -like "*nfre*") {
+      $formFieldTOTPnfre= $line.Split('"')[5]
+    }   
+  }
+  
+  # Form data to post to /osp/a/TOP/auth/app/contractcontinue
+  $formFieldsTOTP2 = @{option =$formFieldTOTPOption
+    nfst =$formFieldTOTPnfst
+    nfpr =$formFieldTOTPnfpr
+    nfmt =$formFieldTOTPnfmt
+    nfcn =$formFieldTOTPnfcn
+    nfch =$formFieldTOTPnfch
+    cexid =$formFieldTOTPcexid  
+    nfre =$formFieldTOTPnfre       
+    nffc =$toptp   
+  }
+  #$formFieldsTOTP2
+  
+  # Post to /osp/a/TOP/auth/oauth2/grant
+  $responseTOTP2 = Invoke-WebRequest -Uri $formURLTOTP2 -WebSession $my_session -Method Post -Body $formFieldsTOTP2 -NoProxy
+  #$responseTOTP2.RawContent
+
+  if ($responseTOTP2.Content -like "*window.location.href*") 
+  {
+    Write-Host "Succesfull login"  
+    $webrequest7 = Invoke-WebRequest -Uri $samlURL -WebSession $my_session -UseBasicParsing
+          
+    $SAMLResponse = $webrequest7.InputFields[0].value
+	  
+    [xml]$root = [System.Text.Encoding]::ASCII.GetString([System.Convert]::FromBase64String($SAMLResponse)) 
+  
+    $PrincipalRolePairs = $root.Response.Assertion.AttributeStatement.Attribute | Where-Object { $_.Name -like 'https://aws.amazon.com/SAML/Attributes/Role' } | Select-Object -ExpandProperty AttributeValue | Select-Object -ExpandProperty '#text' | Sort-Object
+      
+    [System.Collections.ArrayList]$Roles = @()
+    ForEach ( $PrincipalRolePair in $PrincipalRolePairs ) {
+      $Roles.Add( @( $PrincipalRolePair.Split( ',' ) ) ) | Out-Null
+    }
+  
+    For ( $Index = 0 ; $Index -lt $Roles.Count ; $Index++ )
+    {
+      Write-Host ""
+      Write-Host ("Account {0}" -f @( $Roles[$Index].Split(":")[4] ) )
+      Write-Host ("{0,2}: {1}" -f @( ( $Index + 1 ), $Roles[$Index].Split("/")[1] ) )      
+    }
+  
+    [Int]$RoleIndex = Read-Host -Prompt ( 'Role ({0}-{1})' -f @( 1, $Roles.Count ) )
+    if ( ( $RoleIndex -lt 1 ) -or ( $RoleIndex -gt $Roles.Count ) ) {
+      Write-Host "Invalid role index"
+      return
+    }
+    else {
+      $RoleIndex--
+    }
+  
+    $PrincipalARN = $Roles[ $RoleIndex ][0]
+    $RoleARN = $Roles[ $RoleIndex ][1]   
+      
+    Write-Host "Getting AWS token."
+    $RequestBody_PrincipalARN = [uri]::EscapeDataString( $PrincipalARN )
+    $RequestBody_RoleARN = [uri]::EscapeDataString( $RoleARN )
+    $RequestBody_SAML = [uri]::EscapeDataString( $SAMLResponse )  
+  
+    #Test proxy authentication
+    try { 
+      $null = Invoke-WebRequest -Method Get -Uri "https://www.google.com"
+      
+    } catch {
+      Write-Host "Login information required to authenticate to the proxy"
+      #$username = Read-Host -Prompt "Username (domain required)"
+      #$password = Read-Host -Prompt "Password" -AsSecureString 
+	  $username = ""
+	  $password = ConvertTo-SecureString -String "" -AsPlainText -Force
+      $credential = New-Object System.Management.Automation.PSCredential($username,$password)
+  
+      $proxyAuth = $true
+    }
+  
+    $body = -join("Action=AssumeRoleWithSAML&Version=2011-06-15&RoleArn=",$RequestBody_PrincipalARN,"&PrincipalArn=",$RequestBody_RoleARN,"&SAMLAssertion=",$RequestBody_SAML,"&DurationSeconds=",$DurationSeconds)
+  
+    if ($proxyAuth -eq $false) {
+      [XML]$Response = Invoke-WebRequest -Method Post -Uri $stsURL -Body ($body) -WebSession $my_session
+    } else {
+      [XML]$Response = Invoke-WebRequest -Proxy $proxy -ProxyCredential $credential -Method Post -Uri $stsURL -Body ($body) -WebSession $my_session
+    }
+		  
+  	
+    $AWS_ACCESS_KEY_ID   = $Response.AssumeRoleWithSAMLResponse.AssumeRoleWithSAMLResult.Credentials.AccessKeyId
+    $AWS_SECRET_ACCESS_KEY = $Response.AssumeRoleWithSAMLResponse.AssumeRoleWithSAMLResult.Credentials.SecretAccessKey
+    $AWS_SESSION_TOKEN = $Response.AssumeRoleWithSAMLResponse.AssumeRoleWithSAMLResult.Credentials.SessionToken
+	
+	
+  
+    Write-Host "Updating credentials file"
+  
+    try {
+	  & aws configure set aws_access_key_id "$AWS_ACCESS_KEY_ID"
+      & aws configure set aws_secret_access_key "$AWS_SECRET_ACCESS_KEY"
+      & aws configure set aws_session_token "$AWS_SESSION_TOKEN"
+
+  
+      Write-Host "Credential file updated with access key id, secret access key and session token.`nReady to run commands for the session duration"
+    } catch {
+      Write-Host "Unable to run AWS command, make sure AWS CLI is installed"
+    }
+  }  
+} 
+else {
+  Write-Host "Login did not succeed"
+}
